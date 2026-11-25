@@ -1,0 +1,101 @@
+From 8d4518833f7980935a4513b05f316b4e6ec8057c Mon Sep 17 00:00:00 2001
+From: Hugo Komatsu <hugo.komatsu@nutanix.com>
+Date: Wed, 29 Jul 2026 14:28:29 +0000
+Subject: [PATCH] nvmf/vfio_user: mark CQ and shadow doorbell pages dirty for
+ migration
+
+When the client enables DMA logging, libvfio-user's automatic sgl
+dirty tracking only covers buffers accessed via vfu_sgl_get/put.
+The completion queues and shadow doorbells are persistently mapped
+and written directly by the device (SPDK), so they bypass that
+tracking and must be marked dirty explicitly.
+
+Do this in the STOP transition rather than STOP_AND_COPY. By the
+time the device is stopped for migration it has been quiesced and
+every in-flight completion has been posted, but the client takes its
+final dirty-page snapshot before it reads device state in STOP_AND_COPY.
+Marking in STOP_AND_COPY is therefore too late: the last completions
+posted during quiesce are never re-sent, leaving stale entries in the
+destination completion queue that the guest later consumes as phantom
+completions (seen under load as NVMe "genctr mismatch" errors and I/O
+timeouts on the migrated VM).
+
+The explicit dirty marking was originally introduced by commit
+6066e62ee644 ("nvmf/vfio-user: allow multiple reactors"). Restore
+that handling for the v2 migration path, but perform it during STOP
+rather than STOP_AND_COPY to match the v2 state-transition ordering.
+
+Change-Id: If0f23c8ba14e592b94597e5fd586304c8dd36e32
+Signed-off-by: Hugo Komatsu <hugo.komatsu@nutanix.com>
+---
+ lib/nvmf/vfio_user.c | 49 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/lib/nvmf/vfio_user.c b/lib/nvmf/vfio_user.c
+index 6eda82ebee5..054b085b652 100644
+--- a/lib/nvmf/vfio_user.c
++++ b/lib/nvmf/vfio_user.c
+@@ -3841,6 +3841,40 @@ vfio_user_migr_ctrlr_enable_sqs(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+ 	}
+ }
+ 
++/*
++ * The controller is quiesced in STOP, so no requests are active, but CQs and
++ * shadow doorbells remain persistently mapped and may contain writes that
++ * bypass vfu_sgl_put() dirty tracking (SQs are mapped read-only).
++ *
++ * Explicitly mark these mappings dirty before the client's final RAM dirty
++ * sync, which occurs before STOP_AND_COPY transfers device state.
++ */
++static void
++vfio_user_migr_ctrlr_mark_dirty(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
++{
++	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
++	assert(vu_ctrlr->state == VFIO_USER_CTRLR_MIGRATING);
++	for (size_t i = 0; i < NVMF_VFIO_USER_MAX_QPAIRS_PER_CTRLR; i++) {
++		struct nvmf_vfio_user_cq *cq = vu_ctrlr->cqs[i];
++		if (cq == NULL || q_addr(&cq->mapping) == NULL) {
++			continue;
++		}
++		vfu_sgl_mark_dirty(endpoint->vfu_ctx, cq->mapping.sg, 1);
++	}
++	if (vu_ctrlr->sdbl != NULL) {
++		dma_sg_t *sg;
++		size_t i;
++		for (i = 0; i < NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT;
++		     ++i) {
++			if (!vu_ctrlr->sdbl->iovs[i].iov_len) {
++				continue;
++			}
++			sg = index_to_sg_t(vu_ctrlr->sdbl->sgs, i);
++			vfu_sgl_mark_dirty(endpoint->vfu_ctx, sg, 1);
++		}
++	}
++}
++
+ static int
+ vfio_user_migration_device_state_transition(vfu_ctx_t *vfu_ctx,
+ 		vfu_migr_state_t state)
+@@ -3871,7 +3905,22 @@ vfio_user_migration_device_state_transition(vfu_ctx_t *vfu_ctx,
+ 		break;
+ 
+ 	case VFU_MIGR_STATE_STOP:
++		/*
++		 * Source and Destination: Intermediate state.
++		 * The controller is quiesced here, but data transfer hasn't started yet.
++		 * We lock the controller into the MIGRATING state immediately.
++		 */
+ 		vu_ctrlr->state = VFIO_USER_CTRLR_MIGRATING;
++		/*
++		 * Mark device-written pages (CQs, shadow doorbells) dirty in the
++		 * STOP transition, not in STOP_AND_COPY. By STOP the device has
++		 * been quiesced and every in-flight completion has been posted,
++		 * but the client takes its FINAL dirty-page snapshot before it
++		 * reads device state (STOP_AND_COPY). Marking in STOP_AND_COPY is
++		 * too late: the last completions posted during quiesce are lost,
++		 * leaving stale entries in the destination CQ.
++		 */
++		vfio_user_migr_ctrlr_mark_dirty(vu_ctrlr);
+ 		break;
+ 
+ 	case VFU_MIGR_STATE_PRE_COPY:
